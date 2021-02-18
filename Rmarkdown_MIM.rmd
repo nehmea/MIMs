@@ -1,0 +1,510 @@
+---
+title: "Ozgur's Data Analysis"
+author: "Ali Nehme"
+date: "`r format(Sys.time(), '%B %d, %Y %H:%M:%S', 'Canada', T)`"
+output:
+  html_document:
+    df_print: tibble
+    toc: true
+    toc_float: 
+          collapsed: false
+          smooth_scroll: false
+    number_sections: true
+    theme: united
+    #highlight: tango
+    code_folding: show
+    
+  
+---
+
+```{r setup, include=F, cache=F}
+knitr::opts_chunk$set(
+	error = TRUE,
+	message = FALSE,
+	warning = FALSE,
+	include = T
+)
+
+library(limma)
+library(ggthemes)
+library(ggrepel)
+library(ade4)
+library(factoextra)
+library(Rtsne)
+library(UpSetR)
+library(EnhancedVolcano)
+library(apeglm)
+library(tidyverse)
+library(enrichR)
+library(DT)
+#library(plyr)
+library(tidyr)
+library(tibble)
+library(gridExtra)
+library(grid)
+library(clusterProfiler)
+library(annotate)
+library(org.Hs.eg.db)
+library(msigdbr)
+library(ggplot2)
+library(RColorBrewer)
+library(enrichplot)
+library(reshape2)
+library(pheatmap)
+library(ggpubr)
+library(ggbeeswarm)
+library(ggthemes)
+library(Biobase)
+library(WGCNA)
+library(DOSE)
+source('E:/R directory/Scripts/GSEA_modified.R')
+library(GSVA)
+library(vsn)
+source('E:/R directory/Scripts/geom_split_violin.R')
+library(ggpubr)
+#conflicted::conflict_prefer("select", "dplyr")
+
+options(DT.options = list(extensions = c("Buttons" , "FixedColumns"),
+                          autoWidth = TRUE , 
+                           pageLength = 20,
+                           searchHighlight = TRUE,
+                           buttons = c('copy', 'txt', 'print'),
+                           scrollX = F,
+                          class = c('compact cell-border stripe hover'),
+                          rownames = F, filter = 'top')
+           )
+
+```
+
+
+# Data preparation
+
+```{r Data preparation, echo=TRUE, message=FALSE}
+
+#read expression matrix
+q3data = read.table('CountMatrix_Q3.Norm.txt', header=T, sep='\t',row.names=1)
+log2.data=log2(q3data)
+scale.data = scale(log2(q3data))
+vsn.data=normalizeVSN(q3data)
+
+#read annotation file
+pData = read.table("pData.txt", row.names=1, header =T)
+pData= subset(pData, rownames(pData)%in%colnames(q3data))
+for(p in c('Tumor_ratio_green', "Immune_ratio_red", "Stromal_ratio_yellow")){
+  pData[,p] = as.numeric(pData[,p])
+}
+
+#make sure the samples order is consistent between the expression matrix and the samples annotation
+if(!all.equal(colnames(q3data), rownames(pData))){print("Error: colnames(q3data) != rownames(pData)")}
+stopifnot(all.equal(colnames(q3data), rownames(pData)))
+
+
+HALLMARK_genesets = read.table("HALLMARK_genesets.txt", sep = "\t", header = T, row.names = 1)
+
+table.include = c("Description", 'setSize' ,"enrichmentScore", "pvalue", "p.adjust")
+
+```
+
+
+# Sample visualization
+## Data distribution
+```{r echo=TRUE, fig.height=8, fig.width=12, message=FALSE, warning=FALSE, , echo=TRUE, paged.print=FALSE}
+data.list = c('log2.data', 'q3data','scale.data','vsn.data')
+####Density plots
+plots = lapply(data.list, function(x) 
+ggplot(data.frame(melt(data.frame(get(x))), Group = rep(pData$LOX_relative_expression, each = nrow(q3data))),
+       aes(x = value, group = variable, color = Group))+geom_density()+labs(title = x)+theme_few()
+)
+marrangeGrob(plots, ncol=1, nrow = length(data.list),
+             newpage = F, gp = gpar(fontsize = 18,  face = "bold"))
+
+#Violin plots
+plots = lapply(data.list, function(x) 
+  ggplot(data.frame(melt(data.frame(get(x))), Group = rep(pData$LOX_relative_expression, each = nrow(q3data))),
+         aes(x = variable, y=value, fill = Group))+geom_violin()+geom_boxplot(width=0.1, fill = "grey")+
+    labs(title = x)+theme_few())
+marrangeGrob(plots, ncol=1, nrow = length(data.list),
+             newpage = F, gp = gpar(fontsize = 18,  face = "bold"))
+
+
+lapply(data.list, function(x) {meanSdPlot(as.matrix(get(x)))$gg + labs(title = x)})
+
+
+```
+
+VSN transformation seems to perform the best among the other transformation methods.
+
+## PCA
+
+```{r echo=TRUE, fig.height=8, fig.width=12, message=FALSE, warning=FALSE, , echo=TRUE, paged.print=FALSE}
+
+#create an expressionset object
+if(all.equal(colnames(vsn.data), rownames(pData))){
+  eset.vsn = ExpressionSet(assayData= as.matrix(vsn.data),phenoData=new("AnnotatedDataFrame",data=pData))
+}
+
+for(x in  c('vsn.data')) {
+
+colors <- colorRampPalette(rev(brewer.pal(9, "Blues")) )(255)
+
+df_pca <- prcomp(get(x))
+df_out <- as.data.frame(df_pca$rotation)[,1:3]
+df_out = cbind(df_out, pData)
+df_out$repel = paste0(df_out$TMA, '_', df_out$Tumor_ratio_green,'%')
+
+percentage <- round(df_pca$sdev / sum(df_pca$sdev) * 100, 2)
+percentage <- paste0(colnames(df_out), " (", paste(as.character(percentage), " %", ")"))
+
+variables = c('TMA', 'LOX_relative_expression', 
+              'Tumor_ratio_green',
+              "Histology")
+
+plots = lapply(variables, function(p)
+  if(is.factor(df_out[,p])){
+    ggplot(df_out, aes(PC1, PC2))+
+      labs(title=p, x=percentage[1], y = percentage[2], col=p)+
+      geom_point(size=2, aes(col=factor(df_out[,p])))+
+      scale_color_colorblind()+
+      stat_ellipse(aes(col=df_out[,p]))+
+      theme_minimal()+
+      geom_text_repel(data=subset(df_out, rownames(df_out)%in%c('AOI22', 'AOI23', 'AOI24')),
+                      aes(label=repel),
+                      box.padding = unit(0.35, "lines"),
+                      point.padding = unit(0.3, "lines"))
+    
+  }
+  else if(is.numeric(df_out[,p]) | is.integer(df_out[,p])){
+    ggplot(df_out, aes(PC1, PC2))+
+      labs(title=p, x=percentage[1], y = percentage[2], col=p)+
+      geom_point(size=2, aes(col=as.numeric(df_out[,p])))+
+      scale_colour_gradient(low=colors[200], high = colors[1])+
+      stat_ellipse(aes(col=df_out[,p]))+
+      theme_minimal()+
+      geom_text_repel(data=subset(df_out, rownames(df_out)%in%c('AOI22', 'AOI23', 'AOI24')),
+                      aes(label=repel),
+                      box.padding = unit(0.35, "lines"),
+                      point.padding = unit(0.3, "lines"))
+  }
+)
+
+
+print(marrangeGrob(plots, nrow=length(variables)/2, ncol=2, 
+                   newpage = F, 
+                   top = textGrob(paste0(x), gp = gpar(fontsize = 18,  face = "bold")))
+)
+}
+
+
+```
+
+
+
+There are 2 outlier samples that need to be removed. remove them before proceeding in the analysis.
+There are 3 samples per condition. summarize each condition using the average of the 3 samples.
+
+## collapsing
+
+```{r echo=TRUE, fig.height=6, fig.width=12, message=FALSE, warning=FALSE, , echo=TRUE, paged.print=FALSE}
+
+eseti = eset.vsn[,!colnames(eset.vsn)%in%c('AOI22', 'AOI23')]
+
+collapsed.matrix  = t(collapseRows(t(exprs(eseti)),
+                         rowGroup=pData(eseti)$TMA,
+                         rowID=colnames(eseti),
+                         method = "Average",
+                         #method="function", methodFunction=psych::geometric.mean,
+                         connectivityBasedCollapsing=F)$datETcollapsed)
+
+#collapsed.matrix = scale(collapsed.matrix)
+
+new.pData = pData(eseti)
+new.pData = new.pData[!duplicated(new.pData$TMA),]; rownames(new.pData) = new.pData$TMA
+
+if(all.equal(colnames(collapsed.matrix), rownames(new.pData))){
+eset.collapsed = ExpressionSet(assayData= as.matrix(collapsed.matrix), phenoData=new("AnnotatedDataFrame",data=new.pData))}
+
+vioplot::vioplot(collapsed.matrix)
+affycoretools::plotPCA(eset.collapsed,
+                        groups = as.numeric(eset.collapsed$LOX_relative_expression),
+                        groupname = levels(eset.collapsed$LOX_relative_expression))
+
+knitr::kable(summary(pData(eset.collapsed))) 
+
+```
+
+
+
+# Differential gene expression
+
+```{r echo=TRUE, warning=FALSE, , message=FALSE, paged.print=FALSE}
+rm(eset, eseti)
+
+eseti = eset.collapsed[, eset.collapsed$LOX_relative_expression!="Intermediate"]
+eseti$LOX_relative_expression = factor(eseti$LOX_relative_expression, levels = c("Low", "High"))
+
+deg.table = data.frame()
+
+eseti$LOX_relative_expression = relevel(eseti$LOX_relative_expression, ref = "Low")
+design=model.matrix(~LOX_relative_expression, eseti)
+colnames(design) = gsub("LOX_relative_expression", "", colnames(design))
+knitr::kable(data.frame(design, X =" x ",pData(eseti)[, c('LOX_relative_expression', 'TMA', 'Histology')], check.names=F))
+fit = lmFit(eseti, design)
+fit = eBayes(fit)
+
+deg=topTable(fit, coef="High", number=100, sort.by = "P", resort.by = "logFC") 
+deg.table = rbind(deg.table, data.frame(Group = "High_vs_Low", deg[deg$P.Value<0.05,]))
+
+deg.table$subGroup = factor(ifelse(deg.table$logFC>0, paste0(deg.table$Group,".up"),paste0(deg.table$Group,".down")))
+
+cat("DEG: p<0.05")
+summary(deg.table$subGroup[deg.table$P.Value<0.05])
+cat("\n\n DEG: p.adjust<0.05")
+summary(deg.table$subGroup[deg.table$adj.P.Val<0.05])
+print(deg.table[deg.table$adj.P.Val<0.05,1:5])
+
+DEGlist = split(rownames(deg.table),deg.table$subGroup)
+DEGlist2 = split(rownames(deg.table),deg.table$Group)
+
+write.table(deg.table, "Ozgur_DEGs.txt", sep = "\t", col.names = NA)
+
+rm(design, fit, eseti, deg, fit2)
+
+```
+
+
+## Heatmaps
+```{r echo=TRUE, fig.height=10, fig.width=12, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+print(summary(DEGlist)[,1, drop = F])
+
+colors <- colorRampPalette(rev(brewer.pal(9, "RdBu")))(255)
+
+eseti = eset.collapsed[, eset.collapsed$LOX_relative_expression!="Intermediate"]
+eseti$LOX_relative_expression = factor(eseti$LOX_relative_expression, levels = c("Low", "High"))
+annotation_colors = list(
+  LOX_relative_expression = c(Low="gold", High = "darkred"))
+  
+for(i in names(DEGlist2)){
+  
+  cat(paste0("\n\n## ", 'DEG: ', i,'\n\n'))
+  
+  rm(yfg, ggdata, hm.data)
+  yfg = DEGlist2[[i]]
+  if(length(yfg>0)){
+  
+  #heatmap
+  hm.data = data.frame(exprs(eseti))
+  hm.data = hm.data %>% #log2 %>%
+    subset(rownames(hm.data) %in% yfg)
+  hm.data = t(scale(t(hm.data), center = T, scale =T))
+  range <- max(abs(hm.data))
+  annot_col = pData(eseti)[,c("LOX_relative_expression", 'Histology', "TMA")]
+  sig.genes = rownames(deg.table)[deg.table$adj.P.Val<0.05]
+  annot_row = tibble("adj.p<0.05" = factor(ifelse(rownames(hm.data)%in%sig.genes, 1,NA)), 
+                     Gene = rownames(hm.data),
+                     labels = factor(ifelse(rownames(hm.data)%in%sig.genes,rownames(hm.data), ""))) %>% 
+    column_to_rownames('Gene')
+  
+  print(pheatmap(hm.data, main = paste0("DEGs: ", i), cluster_cols = T,
+           clustering_distance_rows = "manhattan", clustering_distance_cols = "manhattan",
+           col = colors, 
+           annotation_col = annot_col,
+           annotation_row = annot_row[,"adj.p<0.05",drop=F], labels_row = annot_row$labels,
+           fontsize_row = 8,
+           border_color = "white", 
+           show_rownames = T, show_colnames = F, 
+           breaks = c(seq(range.default(hm.data)[1], -0.01, length.out = 255/2),
+                      seq(0.01, range.default(hm.data)[2], length.out = 255/2))
+           ))
+  
+  }
+}
+
+```
+
+
+## Overrepresentation analysis
+```{r echo=TRUE, fig.height=10, fig.width=12, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+colors <- colorRampPalette(rev(brewer.pal(9, "Reds")))(100)
+
+for(g in c('HALLMARK_genesets')){
+  ck = compareCluster(geneCluster = DEGlist, fun = "enricher", TERM2GENE=get(g),
+                          pAdjustMethod = "BH",
+                          universe = rownames(eseti),
+                          qvalueCutoff = 0.05
+                         )
+  print(dotplot(ck, showCategory = NULL)+
+    labs(title=paste0(g, ': DEG sets'))+
+      scale_color_continuous(low = colors[1], high = colors[75],
+                               name = "p.adjust", guide=guide_colorbar(reverse=T)) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)))
+}
+
+  
+```
+
+
+# GSEA: Hallmark of cancer
+```{r echo=TRUE, fig.height=10, fig.width=14, message=FALSE, warning=FALSE, paged.print=FALSE}
+
+eseti = eset.collapsed[, eset.collapsed$LOX_relative_expression!="Intermediate"]
+eseti$LOX_relative_expression = factor(eseti$LOX_relative_expression, levels = c("Low", "High"))
+eseti$LOX_relative_expression = relevel(eseti$LOX_relative_expression, ref = "Low")
+design=model.matrix(~LOX_relative_expression, eseti)
+colnames(design) = gsub("LOX_relative_expression", "", colnames(design))
+fit = lmFit(eseti, design)
+fit = eBayes(fit)
+deg = topTable(fit, coef="High", number=Inf) #ADM vs Normal
+
+#fgsea
+cbbPalette <- c("#000000", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+colors = brewer.pal(8, "Set1")
+
+genelist = deg$t
+names(genelist) = rownames(deg)
+genelist = genelist[order(genelist, decreasing = T)]
+#genes <- rownames(deg)[deg$adj.P.Val<0.05]
+for(gs in c('HALLMARK_genesets')){
+gsea.res = GSEA(genelist, TERM2GENE = get(gs), pvalueCutoff = 0.25, verbose=FALSE)
+print(gseaplot2(gsea.res, 
+                geneSetID = rownames(gsea.res@result)[gsea.res@result$enrichmentScore>0],
+                pvalue_table = TRUE, title = paste0(gs, ": High LOX"), subplots = 1:2,
+                color = colors))
+print(gseaplot2(gsea.res, 
+                geneSetID = rownames(gsea.res@result)[gsea.res@result$enrichmentScore<0],
+                pvalue_table = TRUE, title = paste0(gs, ": Low LOX"), subplots = 1:2,
+                color = colors))
+  }
+  
+
+
+  
+```
+
+
+
+# TF regulons: GSEA
+
+```{r echo=TRUE, fig.height=10, fig.width=14, message=FALSE}
+
+#geneset preparation
+for(i in c(#'ChEA_2016',
+           'ENCODE_and_ChEA_Consensus'#,
+           #'ENCODE_TF_ChIP_seq_2015', 'TRANSFAC_and_JASPAR_PWMs', 'TRRUST_Transcription_Factors_2019'
+           )){
+  assign(i, read.gmt(paste0("Enrichr Genesets/", i, ".txt")))
+}
+
+
+#stats
+eseti = eset.collapsed[, eset.collapsed$LOX_relative_expression!="Intermediate"]
+eseti$LOX_relative_expression = factor(eseti$LOX_relative_expression, levels = c("Low", "High"))
+eseti$LOX_relative_expression = relevel(eseti$LOX_relative_expression, ref = "Low")
+design = model.matrix(~LOX_relative_expression, eseti)
+colnames(design) = gsub("LOX_relative_expression", "", colnames(design))
+fit = lmFit(eseti, design)
+fit = eBayes(fit)
+deg=topTable(fit, coef="High", number=Inf) #ADM vs Normal
+
+genelist = deg$t
+names(genelist) = rownames(deg)
+genelist = genelist[order(genelist, decreasing = T)]
+
+#GSEA
+cbbPalette <- c("#000000", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+colors = brewer.pal(8, "Set1")
+
+##TF regulons
+for(gs in c(#'GTRD.TF.regulons', 'GTRD.miRNA.regulons', 'ChEA_2016',
+            'ENCODE_and_ChEA_Consensus'#,
+           #'ENCODE_TF_ChIP_seq_2015', 'TRANSFAC_and_JASPAR_PWMs', 'TRRUST_Transcription_Factors_2019'
+           )){
+gsea.res = GSEA(genelist, TERM2GENE = get(gs), pvalueCutoff = 0.25, verbose=FALSE)
+gsea.df = gsea.res@result
+
+if(nrow(gsea.df)!=0){
+up.genesets = rownames(top_n(gsea.df[gsea.df$enrichmentScore>0, ], -10, p.adjust))
+down.genesets = rownames(top_n(gsea.df[gsea.df$enrichmentScore<0, ], -10, p.adjust))
+
+if(length(up.genesets)!=0){
+print(gseaplot2(gsea.res, 
+                geneSetID = up.genesets,
+                pvalue_table = TRUE, title = paste0(gs, ": High LOX (top 10)"), subplots = 1:2,
+                color = colors))}
+
+if(length(down.genesets)!=0){
+print(gseaplot2(gsea.res, 
+                geneSetID = down.genesets,
+                pvalue_table = TRUE, title = paste0(gs, ": Low LOX (top 10)"), subplots = 1:2,
+                color = colors))}
+
+
+print(cnetplot(gsea.res, foldChange = as.matrix(deg)[,'logFC']))
+
+}
+}
+
+
+```
+
+
+# Validation of top candidates using survival data
+
+```{r echo=TRUE, fig.height=10, fig.width=12, message=FALSE}
+
+library(RTCGA.clinical)
+names(BRCA.clinical)[1:50]
+clin.data <- survivalTCGA(BRCA.clinical,extract.cols=c("admin.disease_code", 
+                                                       "patient.breast_carcinoma_progesterone_receptor_status"))
+table(clin.data$patient.vital_status)
+
+library(RTCGA.mRNA)
+dim(BRCA.mRNA)
+
+
+BRCA.mRNA.clin = BRCA.mRNA %>% 
+                  as_tibble() %>% 
+                  dplyr::select(bcr_patient_barcode, IRF8, E2F4, GABPA, MAX, E2F6) %>% 
+                  mutate(bcr_patient_barcode = substr(bcr_patient_barcode, 1, 12)) %>% 
+                  inner_join(clin.data, by="bcr_patient_barcode") %>%
+                  mutate(progesterone_receptor_status = patient.breast_carcinoma_progesterone_receptor_status) %>% 
+                  dplyr::select(-patient.breast_carcinoma_progesterone_receptor_status) %>%
+                  mutate(IRF8_cat = ifelse(IRF8>=median(IRF8), "High", "Low"),
+                         E2F4_cat = ifelse(E2F4>=median(E2F4), "High", "Low"),
+                         GABPA_cat = ifelse(GABPA>=median(GABPA), "High", "Low"),
+                         MAX_cat = ifelse(MAX>=median(MAX), "High", "Low"),
+                         E2F6_cat = ifelse(E2F6>=median(E2F6), "High", "Low"))
+
+ggdata = BRCA.mRNA.clin %>% 
+  as_tibble() %>% 
+  gather(gene, expression, IRF8, E2F4, GABPA, MAX, E2F6) %>%
+  filter(!is.na(progesterone_receptor_status)) %>%
+
+print(ggplot(ggdata, aes(progesterone_receptor_status, expression, fill=progesterone_receptor_status)) +
+  geom_boxplot()+
+  facet_wrap(~gene)
+)
+
+library(survival)
+library(survminer)
+coxph(Surv(times, patient.vital_status)~progesterone_receptor_status + IRF8 + E2F4 + GABPA + MAX + E2F6, 
+      data=BRCA.mRNA.clin)
+
+for(gene in c('IRF8', 'E2F4', 'GABPA', 'MAX', 'E2F6')){
+  surv.formula = Surv(BRCA.mRNA.clin$times, BRCA.mRNA.clin$patient.vital_status)
+  gene.exp = factor(as.data.frame(BRCA.mRNA.clin)[, paste0(gene, "_cat")])
+  survdata = subset(BRCA.mRNA.clin, select = names(BRCA.mRNA.clin) %in% c(paste0(gene, "_cat"), 'times', 'patient.vital_status'))
+sfit = survfit(surv.formula~gene.exp)
+print(ggsurvplot(sfit, conf.int=F, pval=TRUE, data = survdata, legend.title = gene))
+}
+  
+```
+
+# Session info
+
+```{r echo=TRUE, fig.height=10, fig.width=12, message=FALSE}
+
+sessionInfo()
+  
+```
